@@ -121,7 +121,7 @@ public class Z80Memory implements IMemory {
     @Override
     // Read a word from memory
     public int readWord(int address) {
-        return readByte(address) + readByte(address + 1) * 256;
+        return readByte(address) + (readByte(address + 1) << 8);
     }
 
     @Override

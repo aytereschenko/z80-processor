@@ -44,7 +44,8 @@ public class Z80Core implements ICPUData {
     private int reg_index;
     private boolean EIDIFlag;
     private boolean IFF1, IFF2;
-    private boolean NMI_FF;
+    private volatile boolean NMI_FF;
+    private volatile boolean INT_FF;
     private boolean blockMove;
     private int resetAddress;
     private int interruptMode;
@@ -92,6 +93,8 @@ public class Z80Core implements ICPUData {
         IFF1 = IFF2 = false;
         EIDIFlag = false;
         NMI_FF = false;
+        INT_FF = false;
+        interruptMode = 0;
         //
         reg_PC = resetAddress;
         //
@@ -114,6 +117,15 @@ public class Z80Core implements ICPUData {
     }
 
     /**
+     * Initiate a maskable interrupt (INT) request
+     * Interrupt will be processed if IFF1 is set (interrupts enabled via EI instruction)
+     * Behavior depends on current interrupt mode (0, 1, or 2)
+     */
+    public void setINT() {
+        INT_FF = true;
+    }
+
+    /**
      * Returns the state of the halt flag
      *
      * @return True if the processor has executed a HALT instruction
@@ -123,9 +135,9 @@ public class Z80Core implements ICPUData {
     }
 
     /**
-     * Returns the interrupt mode state
+     * Get the current interrupt mode
      *
-     * @return Mode state
+     * @return Interrupt mode (0, 1, or 2)
      */
     public int getInterruptMode() {
         return interruptMode;
@@ -240,6 +252,46 @@ public class Z80Core implements ICPUData {
                 }
                 ram.writeWord(reg_SP, reg_PC);
                 reg_PC = 0x0066; // NMI routine location
+            }
+        }
+        //
+        // Maskable interrupt (INT) check - only if IFF1 enabled
+        if (INT_FF && IFF1) {
+            // can't interrupt straight after an EI or DI
+            if (! EIDIFlag) {
+                INT_FF = false; // interrupt accepted
+                IFF1 = false;  // disable interrupts
+                IFF2 = false;
+                dec2SP();
+                if (halt) {
+                    incPC(); // point to instruction after HALT
+                }
+                ram.writeWord(reg_SP, reg_PC);
+                //
+                // Behavior depends on interrupt mode
+                switch (interruptMode) {
+                    case 0 -> {
+                        // IM 0: Execute instruction from data bus (typically RST)
+                        int vector = io.getInterruptVector();
+                        // For simplicity, if it's a RST instruction (0xC7, 0xCF, 0xD7, 0xDF, 0xE7, 0xEF, 0xF7, 0xFF)
+                        // extract the address. Default behavior: treat as RST 38h
+                        if ((vector & 0xC7) == 0xC7) {
+                            reg_PC = vector & 0x38; // RST address
+                        } else {
+                            reg_PC = 0x0038; // Default to RST 38h if not a valid RST
+                        }
+                    }
+                    case 1 -> {
+                        // IM 1: Always RST 38h
+                        reg_PC = 0x0038;
+                    }
+                    case 2 -> {
+                        // IM 2: Vector table lookup
+                        int vectorByte = io.getInterruptVector();
+                        int vectorAddress = (reg_I << 8) | vectorByte;
+                        reg_PC = ram.readWord(vectorAddress);
+                    }
+                }
             }
         }
         halt = false;

@@ -40,4 +40,17 @@ public interface IBaseDevice {
     default void IOWrite(int address, int data) {
         // do nothing
     }
+
+    /**
+     * Get the interrupt vector byte for interrupt mode 0 and 2
+     *
+     * For IM 0: Returns the instruction to be executed (typically RST instruction 0xC7-0xFF)
+     * For IM 2: Returns the low byte of the interrupt vector table address
+     *           Combined with I register: address = (I &lt;&lt; 8) | getInterruptVector()
+     *
+     * @return The 8 bit interrupt vector value from the interrupting device
+     */
+    default int getInterruptVector() {
+        return 0xFF; // Default to RST 38h for IM 0, or 0xFF for IM 2
+    }
 }
