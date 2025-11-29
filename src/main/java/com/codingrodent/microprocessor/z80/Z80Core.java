@@ -27,15 +27,14 @@ import static com.codingrodent.microprocessor.z80.CPUConstants.*;
  */
 public class Z80Core implements ICPUData {
 
-    //
     // maximum address size
     private final static int MAX_ADDRESS = 0xFFFF;
     private final IMemory ram;
     private final IBaseDevice io;
-    //
     private int instruction;
     private boolean halt;
     private long tStates;
+
     /* registers */
     private int reg_B, reg_C, reg_D, reg_E, reg_H, reg_L;
     private int reg_B_ALT, reg_C_ALT, reg_D_ALT, reg_E_ALT, reg_H_ALT, reg_L_ALT;
@@ -43,7 +42,8 @@ public class Z80Core implements ICPUData {
     private int reg_A, reg_A_ALT, reg_F, reg_F_ALT, reg_I, reg_R, reg_R8;
     private int reg_index;
     private boolean EIDIFlag;
-    private boolean IFF1, IFF2;
+    private boolean IFF1;
+    private boolean IFF2;
     private volatile boolean NMI_FF;
     private volatile boolean INT_FF;
     private boolean blockMove;
@@ -61,7 +61,6 @@ public class Z80Core implements ICPUData {
         this.ram = ram;
         this.io = io;
         tStates = 0;
-        //
         blockMove = false;
         resetAddress = 0x0000;
     }
@@ -70,7 +69,29 @@ public class Z80Core implements ICPUData {
      * Public interfaces to processor control functions
      */
 
-    /**
+	public int getIff() {
+		return (IFF1 ? 1: 0) | (IFF2 ? 2 : 0);
+	}
+
+	public void setIff(int iff) {
+		IFF1 = (iff & 0x01) != 0;
+		IFF2 = (iff & 0x02) != 0;
+	}
+
+	/**
+	 * Get the current interrupt mode
+	 *
+	 * @return Interrupt mode (0, 1, or 2)
+	 */
+	public int getInterruptMode() {
+		return interruptMode;
+	}
+
+	public void setInterruptMode(int mode) {
+		interruptMode = mode;
+	}
+
+	/**
      * Indicate when a block move instruction is in progress, LDIR, CPDR etc. May be sampled during repetitive cycles of
      * the instruction
      *
@@ -85,7 +106,6 @@ public class Z80Core implements ICPUData {
      */
     private void processorReset() {
         halt = false;
-        //
         reg_B = reg_C = reg_D = reg_E = reg_H = reg_L = 0;
         reg_B_ALT = reg_C_ALT = reg_D_ALT = reg_E_ALT = reg_H_ALT = reg_L_ALT = 0;
         reg_IX = reg_IY = reg_SP = 0;
@@ -95,9 +115,7 @@ public class Z80Core implements ICPUData {
         NMI_FF = false;
         INT_FF = false;
         interruptMode = 0;
-        //
         reg_PC = resetAddress;
-        //
         tStates = 0;
         interruptMode = 0;
     }
@@ -113,8 +131,21 @@ public class Z80Core implements ICPUData {
      * Initiate an NMI request
      */
     public void setNMI() {
-        NMI_FF = true;
-    }
+		// can't interrupt straight after an EI or DI
+		if (!EIDIFlag) {
+			IFF1 = false; // disable interrupts
+			dec2SP();
+			if (halt) {
+				incPC();
+				halt = false;
+			}
+			ram.writeWord(reg_SP, reg_PC);
+			reg_PC = 0x0066; // NMI routine location
+			tStates += 10;
+		} else {
+			NMI_FF = true; // postpone NMI signal by 1 instruction
+		}
+	}
 
     /**
      * Initiate a maskable interrupt (INT) request
@@ -122,7 +153,49 @@ public class Z80Core implements ICPUData {
      * Behavior depends on current interrupt mode (0, 1, or 2)
      */
     public void setINT() {
-        INT_FF = true;
+		// can't interrupt straight after an EI or DI
+		if (!EIDIFlag) {
+			if (IFF1) { // only if interrupts are enabled
+				IFF1 = false;  // disable interrupts
+				IFF2 = false;
+				dec2SP();
+				if (halt) {
+					incPC();
+					halt = false;
+				}
+				ram.writeWord(reg_SP, reg_PC);
+
+				// Behavior depends on interrupt mode
+				switch (interruptMode) {
+					case 0 -> {
+						// IM 0: Execute instruction from data bus (typically RST)
+						int vector = io.getInterruptVector();
+						// For simplicity, if it's a RST instruction (0xC7, 0xCF, 0xD7, 0xDF, 0xE7, 0xEF, 0xF7, 0xFF)
+						// extract the address. Default behavior: treat as RST 38h
+						if ((vector & 0xC7) == 0xC7) {
+							reg_PC = vector & 0x38; // RST address
+						} else {
+							reg_PC = 0x0038; // Default to RST 38h if not a valid RST
+						}
+						tStates += 12;
+					}
+					case 1 -> {
+						// IM 1: Always RST 38h
+						reg_PC = 0x0038;
+						tStates += 12;
+					}
+					case 2 -> {
+						// IM 2: Vector table lookup
+						int vectorByte = io.getInterruptVector();
+						int vectorAddress = (reg_I << 8) | vectorByte;
+						reg_PC = ram.readWord(vectorAddress);
+						tStates += 18;
+					}
+				}
+			}
+		} else {
+			INT_FF = true; // postpone INT signal by 1 instruction
+		}
     }
 
     /**
@@ -132,15 +205,6 @@ public class Z80Core implements ICPUData {
      */
     public boolean getHalt() {
         return halt;
-    }
-
-    /**
-     * Get the current interrupt mode
-     *
-     * @return Interrupt mode (0, 1, or 2)
-     */
-    public int getInterruptMode() {
-        return interruptMode;
     }
 
     /**
@@ -237,68 +301,28 @@ public class Z80Core implements ICPUData {
     /**
      * Execute a single instruction at the present program counter (PC) then return. The internal state of the processor
      * is updated along with the T state count.
+	 * Returns true if an opcode has been executed.
+	 * Returns false, if interrupt was accepted and CPU jumped to the start of the interrupt code, without executing an opcode
      */
     public void executeOneInstruction() {
-        //
-        // NMI check first
-        if (NMI_FF) {
-            // can't interrupt straight after an EI or DI
-            if (!EIDIFlag) {
-                NMI_FF = false; // interrupt accepted
-                IFF2 = IFF1; // store IFF state
-                dec2SP();
-                if (halt) {
-                    incPC(); // Was a bug ! - point to instruction after(!) interrupt location. HALT decrements PC !!!
-                }
-                ram.writeWord(reg_SP, reg_PC);
-                reg_PC = 0x0066; // NMI routine location
-            }
-        }
-        //
-        // Maskable interrupt (INT) check - only if IFF1 enabled
-        if (INT_FF && IFF1) {
-            // can't interrupt straight after an EI or DI
-            if (! EIDIFlag) {
-                INT_FF = false; // interrupt accepted
-                IFF1 = false;  // disable interrupts
-                IFF2 = false;
-                dec2SP();
-                if (halt) {
-                    incPC(); // point to instruction after HALT
-                }
-                ram.writeWord(reg_SP, reg_PC);
-                //
-                // Behavior depends on interrupt mode
-                switch (interruptMode) {
-                    case 0 -> {
-                        // IM 0: Execute instruction from data bus (typically RST)
-                        int vector = io.getInterruptVector();
-                        // For simplicity, if it's a RST instruction (0xC7, 0xCF, 0xD7, 0xDF, 0xE7, 0xEF, 0xF7, 0xFF)
-                        // extract the address. Default behavior: treat as RST 38h
-                        if ((vector & 0xC7) == 0xC7) {
-                            reg_PC = vector & 0x38; // RST address
-                        } else {
-                            reg_PC = 0x0038; // Default to RST 38h if not a valid RST
-                        }
-                    }
-                    case 1 -> {
-                        // IM 1: Always RST 38h
-                        reg_PC = 0x0038;
-                    }
-                    case 2 -> {
-                        // IM 2: Vector table lookup
-                        int vectorByte = io.getInterruptVector();
-                        int vectorAddress = (reg_I << 8) | vectorByte;
-                        reg_PC = ram.readWord(vectorAddress);
-                    }
-                }
-            }
-        }
-        halt = false;
-        instruction = ram.readByte(reg_PC);
-        incPC();
-        EIDIFlag = false; // clear prior to decoding next instruction
-        decodeOneByteInstruction(instruction);
+		instruction = ram.readByte(reg_PC);
+		incPC();
+		if (EIDIFlag) {
+			EIDIFlag = false;
+			decodeOneByteInstruction(instruction);
+			if (!EIDIFlag) {
+				if (NMI_FF) {
+					NMI_FF = false;
+					setNMI();
+				}
+				if (INT_FF) {
+					INT_FF = false;
+					setINT();
+				}
+			}
+		} else {
+			decodeOneByteInstruction(instruction);
+		}
     }
 
     /**
@@ -316,6 +340,10 @@ public class Z80Core implements ICPUData {
     public void resetTStates() {
         tStates = 0;
     }
+
+	public void deductTStates(int amount) {
+		tStates = Math.max(0, tStates - amount);
+	}
 
     /**
      * Execute all one byte instructions and pass multibyte instructions on for further processing
@@ -3411,5 +3439,36 @@ public class Z80Core implements ICPUData {
     public String toString() {
         return getName() + " Revision " + getMajorVersion() + "." + getMinorVersion() + "." + getPatchVersion();
     }
+
+	/**
+	 * Dumps all registers in hex format on one line.
+	 * Format: PC=XXXX HL=XXXX DE=XXXX BC=XXXX AF=XXXX HL'=XXXX DE'=XXXX BC'=XXXX AF'=XXXX IX=XXXX IY=XXXX IR=XXXX SP=XXXX IM=X IFF1=X IFF2=X
+	 */
+	public String dump() {
+		String mem = "%02X%02X%02X%02X".formatted(ram.readByte(reg_PC), ram.readByte(reg_PC + 1), ram.readByte(reg_PC + 2), ram.readByte(reg_PC + 3));
+		return "PC=%04X .. %s .. HL=%04X DE=%04X BC=%04X AF=%02X%02X HL'=%04X DE'=%04X BC'=%04X AF'=%02X%02X IX=%04X IY=%04X IR=%02X%02X SP=%04X IM=%d IFF1=%d IFF2=%d t=%d".formatted(
+				getRegisterValue(RegisterNames.PC),
+				mem,
+				getRegisterValue(RegisterNames.HL),
+				getRegisterValue(RegisterNames.DE),
+				getRegisterValue(RegisterNames.BC),
+				getRegisterValue(RegisterNames.A),
+				getRegisterValue(RegisterNames.F),
+				getRegisterValue(RegisterNames.HL_ALT),
+				getRegisterValue(RegisterNames.DE_ALT),
+				getRegisterValue(RegisterNames.BC_ALT),
+				getRegisterValue(RegisterNames.A_ALT),
+				getRegisterValue(RegisterNames.F_ALT),
+				getRegisterValue(RegisterNames.IX),
+				getRegisterValue(RegisterNames.IY),
+				getRegisterValue(RegisterNames.I),
+				getRegisterValue(RegisterNames.R),
+				getRegisterValue(RegisterNames.SP),
+				interruptMode,
+				IFF1 ? 1 : 0,
+				IFF2 ? 1 : 0,
+				tStates
+		);
+	}
 
 }
